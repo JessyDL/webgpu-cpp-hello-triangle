@@ -2,6 +2,8 @@
 
 Simple hello triangle example using the current API of WebGPU using C++/WASM and Emscripten.
 
+Due to the hand-wavy nature of this example, certain important concepts are not implemented (such as handling device lost, swapchain resize events, caching renderpasses). These might be implemented at a later date, but it's not strictly important for a simple hello triangle and would needlessly complicate the example which is aimed at showing the basic concept.
+
 Following is an example output of the html canvas:
 
 ![example output](output.png "example output" )
