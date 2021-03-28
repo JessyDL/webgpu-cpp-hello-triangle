@@ -11,6 +11,12 @@
 static constexpr auto DEFAULT_SWAPCHAIN_FORMAT = wgpu::TextureFormat::BGRA8Unorm;
 static constexpr auto DEFAULT_DEPTH_FORMAT     = wgpu::TextureFormat::Depth32Float;
 
+#define LOG(msg, ...)                                                                                      \
+	{                                                                                                      \
+		std::string endlined_msg { std::string{"log:  "} + msg };                                          \
+		endlined_msg += " (in %s:%i -> %s)\n";                                                             \
+		printf(endlined_msg.data() __VA_OPT__(,) __VA_ARGS__, __FILE__, __LINE__, __PRETTY_FUNCTION__);    \
+	}
 
 #define TODO(msg)                                                                 \
 	{                                                                             \
@@ -153,14 +159,56 @@ namespace psl::webgpu
 	inline namespace
 	{
 		template<typename T>
+		concept IsDestructible = requires(T t) { t.Destroy(); };
+
+		template<typename T>
 		class wgpu_resource_t
 		{
 		  public:
 			constexpr auto resource() const noexcept -> const T& { return m_Resource; }
+			~wgpu_resource_t()
+			{
+				if(m_ID == std::numeric_limits<size_t>::max())
+					return;
+				LOG("destroying ID[%lu]", m_ID);
+				if constexpr(IsDestructible<T>)
+				{
+					m_Resource.Destroy();
+				}
+			}
+
+			constexpr wgpu_resource_t(wgpu_resource_t&& other) noexcept : m_Resource(other.m_Resource), m_ID(other.m_ID)
+			{
+				other.m_ID = std::numeric_limits<size_t>::max();
+			}
+
+			constexpr wgpu_resource_t& operator=(wgpu_resource_t&& other) noexcept
+			{
+				if(this != &other)
+				{
+					m_ID = other.m_ID;
+					m_Resource = other.m_Resource;
+					other.m_ID = std::numeric_limits<size_t>::max();
+				}
+				return *this;
+			}
+			wgpu_resource_t(const wgpu_resource_t& other) = delete;
+			wgpu_resource_t& operator=(const wgpu_resource_t& other) = delete;
+			
 		  protected:
-			constexpr wgpu_resource_t(T resource) noexcept : m_Resource(resource) {}
-			constexpr wgpu_resource_t() noexcept = default;
+			wgpu_resource_t(T resource) noexcept : m_Resource(resource)
+			{
+				LOG("creating ID[%lu]", m_ID);
+			}
+
+			wgpu_resource_t() noexcept
+			{				
+				LOG("creating ID[%lu]", m_ID);
+			}
+
 			T m_Resource{};
+			size_t m_ID{m_IDGenerator++};
+			static inline size_t m_IDGenerator = 0;
 		};
 	}
 	class device	:	public wgpu_resource_t<wgpu::Device>
@@ -230,10 +278,18 @@ namespace psl::webgpu
 			m_DepthFormat(depthFormat.value_or(DEFAULT_DEPTH_FORMAT)),
 			m_PresentMode(presentMode)
 		{
+			LOG("creating swapchain [width: %lu] [height: %lu]", width, height);
 			recreate_swapchain(depthFormat.has_value());
 		}
 
-		void resize(size_t width, size_t height) { m_Width = width; m_Height = height; recreate_swapchain(m_DepthTexture.has_value()); }
+		void resize(size_t width, size_t height)
+		{ 
+			m_Width = width;
+			m_Height = height;
+			LOG("recreating swapchain [width: %lu] [height: %lu]", width, height);
+			recreate_swapchain(m_DepthTexture.has_value());
+		}
+
 		constexpr auto width() const noexcept -> size_t { return m_Width; }
 		constexpr auto height() const noexcept -> size_t { return m_Height; }
 
@@ -252,7 +308,7 @@ namespace psl::webgpu
 			m_Resource = m_Device.resource().CreateSwapChain(m_Surface.resource(), &scDesc);
 			if(withDepth)
 			{
-				m_DepthTexture = texture{m_Device, m_Width, m_Height, 1u, m_DepthFormat, wgpu::TextureUsage::RenderAttachment};
+				m_DepthTexture = std::move(texture{m_Device, m_Width, m_Height, 1u, m_DepthFormat, wgpu::TextureUsage::RenderAttachment});
 			}
 		}
 		device& m_Device;
@@ -417,48 +473,76 @@ namespace psl::webgpu
 			m_Resource = device.resource().CreateRenderPipeline(&descriptor);
 		}
 	};
+
+	class renderpass	:	public wgpu_resource_t<wgpu::RenderPassDescriptor>
+	{
+		public:
+		renderpass(swapchain& swapchain)	:	m_SwapChain(swapchain)
+		{
+			m_ColourAttachment.attachment           = swapchain.resource().GetCurrentTextureView();
+			m_ColourAttachment.clearColor           = { 0.6, 0.6, 0.6, 1.0 };
+			m_ColourAttachment.storeOp              = wgpu::StoreOp::Store;
+			m_DepthStencilAttachment.attachment     = swapchain.depth_resource().CreateView();
+			m_DepthStencilAttachment.clearDepth     = 1.0;
+			m_DepthStencilAttachment.depthStoreOp   = wgpu::StoreOp::Store;
+			m_DepthStencilAttachment.clearStencil   = 0;
+			m_DepthStencilAttachment.stencilStoreOp = wgpu::StoreOp::Clear;
+
+			m_Resource.colorAttachments       = &m_ColourAttachment;
+			m_Resource.colorAttachmentCount   = 1;
+			m_Resource.depthStencilAttachment = &m_DepthStencilAttachment;
+		}
+
+		void draw(device& device, queue& queue)
+		{
+			m_ColourAttachment.attachment = m_SwapChain.resource().GetCurrentTextureView();
+			auto commandEncoder = device.resource().CreateCommandEncoder();
+
+			auto renderPassEncoder = commandEncoder.BeginRenderPass(&m_Resource);
+			renderPassEncoder.ExecuteBundles(1, &m_RenderBundle);
+			renderPassEncoder.EndPass();
+
+			auto commandBuffer = commandEncoder.Finish();
+			queue.resource().Submit(1u, &commandBuffer);
+		}
+
+		auto begin(device& device) -> auto&
+		{
+			wgpu::RenderBundleEncoderDescriptor descriptor{};
+			descriptor.colorFormatsCount = 1;
+			descriptor.colorFormats = &DEFAULT_SWAPCHAIN_FORMAT;
+			descriptor.depthStencilFormat = DEFAULT_DEPTH_FORMAT;
+			descriptor.sampleCount = 1;
+
+			m_RenderBundleEncoder = device.resource().CreateRenderBundleEncoder(&descriptor);
+			return m_RenderBundleEncoder;
+		}
+
+		void end()
+		{
+			m_RenderBundle = m_RenderBundleEncoder.Finish();			
+		}
+
+		private:
+		swapchain&                                       m_SwapChain;
+		wgpu::RenderBundle                               m_RenderBundle;
+		wgpu::RenderBundleEncoder                        m_RenderBundleEncoder;
+		wgpu::RenderPassColorAttachmentDescriptor        m_ColourAttachment{};
+		wgpu::RenderPassDepthStencilAttachmentDescriptor m_DepthStencilAttachment{};
+	};
 }
 
-std::unique_ptr<psl::webgpu::device>                                  m_Device        = nullptr;
-std::unique_ptr<psl::webgpu::surface>                                 m_Surface       = nullptr;
-std::unique_ptr<psl::webgpu::swapchain>                               m_SwapChain     = nullptr;
-std::unique_ptr<psl::webgpu::pipeline>                                m_Pipeline      = nullptr;
-std::unique_ptr<psl::webgpu::buffer<psl::webgpu::buffer_usage::VBO>>  m_VertexBuffer  = nullptr;
-std::unique_ptr<psl::webgpu::queue>                                   m_Queue         = nullptr;
+std::unique_ptr<psl::webgpu::device>                                  m_Device          = nullptr;
+std::unique_ptr<psl::webgpu::surface>                                 m_Surface         = nullptr;
+std::unique_ptr<psl::webgpu::swapchain>                               m_SwapChain       = nullptr;
+std::unique_ptr<psl::webgpu::pipeline>                                m_Pipeline        = nullptr;
+std::unique_ptr<psl::webgpu::buffer<psl::webgpu::buffer_usage::VBO>>  m_VertexBuffer    = nullptr;
+std::unique_ptr<psl::webgpu::queue>                                   m_Queue           = nullptr;
+std::unique_ptr<psl::webgpu::renderpass>                              m_RenderPass      = nullptr;
 
 void render_loop()
 {
-	TODO_ONCE("use renderbuffer to cache draw instruction/renderpass setup");
-	wgpu::RenderPassDescriptor descr{};
-	wgpu::RenderPassColorAttachmentDescriptor swapchainColorAttachment{};
-	swapchainColorAttachment.attachment = m_SwapChain->resource().GetCurrentTextureView();
-	swapchainColorAttachment.clearColor = { 0.6, 0.6, 0.6, 1.0 };
-	swapchainColorAttachment.storeOp    = wgpu::StoreOp::Store;
-
-	
-	wgpu::RenderPassDepthStencilAttachmentDescriptor swapchainDepthStencilAttachment{};
-	swapchainDepthStencilAttachment.attachment      = m_SwapChain->depth_resource().CreateView();
-	swapchainDepthStencilAttachment.clearDepth     = 1.0;
-	swapchainDepthStencilAttachment.depthStoreOp   = wgpu::StoreOp::Store;
-	swapchainDepthStencilAttachment.clearStencil   = 0;
-	swapchainDepthStencilAttachment.stencilStoreOp = wgpu::StoreOp::Clear;
-
-	descr.colorAttachments       = &swapchainColorAttachment;
-	descr.colorAttachmentCount   = 1;
-	descr.depthStencilAttachment = &swapchainDepthStencilAttachment;
-
-	auto commandEncoder = m_Device->resource().CreateCommandEncoder();
-	auto renderPass = commandEncoder.BeginRenderPass(&descr);
-
-	{ // actual drawing of objects happen here
-		renderPass.SetPipeline(m_Pipeline->resource());
-		renderPass.SetVertexBuffer(0, m_VertexBuffer->resource());
-		renderPass.Draw(3, 1, 0, 0);
-	}
-
-	renderPass.EndPass();
-	auto renderBuffer = commandEncoder.Finish();
-	m_Queue->resource().Submit(1, &renderBuffer);
+	m_RenderPass->draw(*m_Device, *m_Queue);
 }
 
 void resize_swapchain()
@@ -489,6 +573,17 @@ int main()
 	m_VertexBuffer->map(vertex_data);
 
 	m_Queue = std::make_unique<psl::webgpu::queue>(*m_Device);
+	m_RenderPass = std::make_unique<psl::webgpu::renderpass>(*m_SwapChain);
+
+	// we record the draw instruction once into a GPURenderBundle contained inside the renderpass abstraction.
+	// this way we record once, and resubmit our non-dynamic data, rather than re-recording every frame.
+	{
+		auto renderPass = m_RenderPass->begin(*m_Device);
+		renderPass.SetPipeline(m_Pipeline->resource());
+		renderPass.SetVertexBuffer(0, m_VertexBuffer->resource());
+		renderPass.Draw(3, 1, 0, 0);
+		m_RenderPass->end();
+	}	
 
     emscripten_set_main_loop(render_loop, 0, false);
 
