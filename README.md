@@ -2,6 +2,10 @@
 
 Simple hello triangle example using the current API of WebGPU using C++/WASM and Emscripten.
 
+Following is an example output of the html canvas:
+
+![example output](output.png "example output" )
+
 # build
 To build run the following command from the root directory.
 ```
