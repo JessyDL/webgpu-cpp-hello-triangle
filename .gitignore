@@ -30,3 +30,10 @@
 *.exe
 *.out
 *.app
+
+*.wasm.map
+
+# release output
+*.html
+*.js
+*.wasm
